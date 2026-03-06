@@ -37,7 +37,7 @@ runs:
   steps:
     - name: Install Puppeteer
       shell: bash
-      run: npm install puppeteer
+      run: npm install --prefix "${{ github.action_path }}" puppeteer
 
     - name: Detect build directory
       id: detect
@@ -58,8 +58,6 @@ runs:
 
     - name: Prerender pages
       shell: bash
-      env:
-        NODE_PATH: ${{ github.workspace }}/node_modules
       run: |
         node "${{ github.action_path }}/prerender.mjs" \
           --build-dir="${{ steps.detect.outputs.build-dir }}" \

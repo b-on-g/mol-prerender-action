@@ -84,10 +84,8 @@ function make_url( screen_id ) {
 
 function make_sitemap_url( screen_id ) {
 	if ( !screen_id ) return BASE_URL
-	if ( ROUTE_FORMAT === '?' ) {
-		return `${ BASE_URL }?${ ROUTE_KEY }=${ screen_id }`
-	}
-	return `${ BASE_URL }#!${ ROUTE_KEY }=${ screen_id }`
+	// Sitemap points to actual static HTML files, not hash/query URLs
+	return `${ BASE_URL }${ screen_id }.html`
 }
 
 async function prerender() {

@@ -35,10 +35,6 @@ inputs:
 runs:
   using: "composite"
   steps:
-    - name: Install Puppeteer
-      shell: bash
-      run: npm install --prefix "${{ github.action_path }}" puppeteer
-
     - name: Detect build directory
       id: detect
       shell: bash
@@ -56,7 +52,32 @@ runs:
         echo "root-fqn=$ROOT_FQN" >> "$GITHUB_OUTPUT"
         echo "Detected: build-dir=$BUILD_DIR root=$ROOT_FQN"
 
+    - name: Compute cache key
+      id: cache-key
+      shell: bash
+      run: |
+        BUILD_DIR="${{ steps.detect.outputs.build-dir }}"
+        HASH=$(cat "$BUILD_DIR/web.js" "$BUILD_DIR/web.css" 2>/dev/null | sha256sum | cut -d' ' -f1)
+        SCREENS_HASH=$(echo "${{ inputs.screens }}${{ inputs.base-url }}${{ inputs.route-format }}${{ inputs.route-key }}${{ inputs.viewport }}" | sha256sum | cut -d' ' -f1)
+        echo "key=prerender-${HASH}-${SCREENS_HASH}" >> "$GITHUB_OUTPUT"
+
+    - name: Restore prerender cache
+      id: prerender-cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          ${{ steps.detect.outputs.build-dir }}/*.html
+          ${{ steps.detect.outputs.build-dir }}/sitemap.xml
+          ${{ steps.detect.outputs.build-dir }}/robots.txt
+        key: ${{ steps.cache-key.outputs.key }}
+
+    - name: Install Puppeteer
+      if: steps.prerender-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: npm install --prefix "${{ github.action_path }}" puppeteer
+
     - name: Prerender pages
+      if: steps.prerender-cache.outputs.cache-hit != 'true'
       shell: bash
       run: |
         node "${{ github.action_path }}/prerender.mjs" \

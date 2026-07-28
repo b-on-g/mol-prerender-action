@@ -16,13 +16,24 @@ inputs:
     required: false
     default: ""
   route-format:
-    description: 'URL routing format: "#!" (hash, default) or "?" (query string)'
+    description: >
+      URL routing format: "#!" (hash, default), "?" (query string), or "path"
+      (clean pathname). In "path" mode each screen is a full route string
+      (e.g. section=docs/page=views), pages are written to <route>/index.html so a
+      static host serves them at /<route> with a 200, and per-page <title>/meta/og/
+      canonical/hreflang are injected from the app's data-bog-meta.
     required: false
     default: "#!"
   route-key:
-    description: "URL parameter key for screen routing"
+    description: "URL parameter key for screen routing (unused in path mode)"
     required: false
     default: "screen"
+  sitemap-file:
+    description: >
+      Optional path to a committed sitemap.xml. In "path" mode every <loc> under
+      base-url is prerendered as a route (single source of truth for the route list).
+    required: false
+    default: ""
   viewport:
     description: "Viewport size as WIDTHxHEIGHT"
     required: false
@@ -71,7 +82,7 @@ runs:
       run: |
         BUILD_DIR="${{ steps.detect.outputs.build-dir }}"
         HASH=$(cat "$BUILD_DIR/web.js" "$BUILD_DIR/web.css" 2>/dev/null | sha256sum | cut -d' ' -f1)
-        SCREENS_HASH=$(echo "${{ inputs.screens }}${{ inputs.base-url }}${{ inputs.route-format }}${{ inputs.route-key }}${{ inputs.viewport }}" | sha256sum | cut -d' ' -f1)
+        SCREENS_HASH=$(echo "${{ inputs.screens }}${{ inputs.base-url }}${{ inputs.route-format }}${{ inputs.route-key }}${{ inputs.viewport }}$(cat '${{ inputs.sitemap-file }}' 2>/dev/null)" | sha256sum | cut -d' ' -f1)
         echo "key=prerender-${HASH}-${SCREENS_HASH}" >> "$GITHUB_OUTPUT"
 
     - name: Restore prerender cache
@@ -80,6 +91,7 @@ runs:
       with:
         path: |
           ${{ steps.detect.outputs.build-dir }}/*.html
+          ${{ steps.detect.outputs.build-dir }}/**/index.html
           ${{ steps.detect.outputs.build-dir }}/sitemap.xml
           ${{ steps.detect.outputs.build-dir }}/robots.txt
         key: ${{ steps.cache-key.outputs.key }}
@@ -100,5 +112,6 @@ runs:
           --screens="${{ inputs.screens }}" \
           --route-format="${{ inputs.route-format }}" \
           --route-key="${{ inputs.route-key }}" \
+          --sitemap-file="${{ inputs.sitemap-file }}" \
           --viewport="${{ inputs.viewport }}" \
           --timeout="${{ inputs.timeout }}"

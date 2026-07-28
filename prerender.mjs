@@ -2,8 +2,8 @@
 
 import puppeteer from 'puppeteer'
 import { createServer } from 'http'
-import { readFile, writeFile } from 'fs/promises'
-import { join, extname } from 'path'
+import { readFile, writeFile, mkdir } from 'fs/promises'
+import { join, extname, dirname } from 'path'
 import { existsSync } from 'fs'
 
 // Parse CLI args: --key=value
@@ -24,10 +24,34 @@ const ROUTE_KEY = args[ 'route-key' ] || 'screen'
 const VIEWPORT = args[ 'viewport' ] || '430x932'
 const TIMEOUT = parseInt( args[ 'timeout' ] || '15000' )
 
+// Mount = the path the app is served under (from base-url), e.g. `/smalljs/`.
+// For `path` routing the app's client router only activates under this prefix,
+// and static assets (web.js) resolve relative to it.
+const MOUNT = ( () => {
+	try { return new URL( BASE_URL ).pathname.replace( /\/?$/, '/' ) }
+	catch { return '/' }
+} )()
+
+// In `path` mode each entry is a full pathname route (e.g. `section=docs/page=views`);
+// in `#!`/`?` mode each is a single route-key value (legacy behaviour).
 const SCREENS = ( args[ 'screens' ] || '' )
 	.split( /[\n,]/ )
 	.map( s => s.trim() )
 	.filter( Boolean )
+
+// `path` mode can also take the full route list straight from a committed sitemap.xml
+// (single source of truth): every <loc> under base-url becomes a route to prerender.
+const SITEMAP_FILE = args[ 'sitemap-file' ] || ''
+
+async function routes_from_sitemap() {
+	if ( !SITEMAP_FILE || !existsSync( SITEMAP_FILE ) ) return []
+	const xml = await readFile( SITEMAP_FILE, 'utf-8' )
+	return [ ...xml.matchAll( /<loc>([^<]+)<\/loc>/g ) ]
+		.map( m => m[ 1 ].trim() )
+		.filter( u => u.startsWith( BASE_URL ) )
+		.map( u => u.slice( BASE_URL.length ) )   // route relative to base
+		.filter( r => r && !r.endsWith( '.md' ) ) // skip raw .md endpoints (already static)
+}
 
 const PORT = 9222
 
@@ -44,11 +68,15 @@ const MIME = {
 	'.baza': 'application/octet-stream',
 }
 
+// Serve BUILD_DIR under MOUNT, mirroring GitHub Pages: real files win, any unknown
+// path under the mount falls back to index.html (SPA).
 function serve() {
 	return new Promise( resolve => {
 		const server = createServer( async ( req, res ) => {
 			const url = new URL( req.url, `http://localhost:${ PORT }` )
-			let path = url.pathname === '/' ? '/index.html' : url.pathname
+			let path = decodeURIComponent( url.pathname )
+			if ( MOUNT !== '/' && path.startsWith( MOUNT ) ) path = '/' + path.slice( MOUNT.length )
+			if ( path === '/' || path === '' ) path = '/index.html'
 			const file = join( BUILD_DIR, path )
 
 			try {
@@ -68,24 +96,96 @@ function serve() {
 			}
 		} )
 		server.listen( PORT, () => {
-			console.log( `Server on http://localhost:${ PORT }` )
+			console.log( `Server on http://localhost:${ PORT }${ MOUNT } (mount ${ MOUNT })` )
 			resolve( server )
 		} )
 	} )
 }
 
-function make_url( screen_id ) {
-	if ( !screen_id ) return `http://localhost:${ PORT }/`
-	if ( ROUTE_FORMAT === '?' ) {
-		return `http://localhost:${ PORT }/?${ ROUTE_KEY }=${ screen_id }`
+// URL to navigate for a given route. `path` mode loads from the mount root via the
+// GitHub-Pages `?/`-fallback form (rafgraph), exactly like a real deep-link cold load:
+// assets resolve from the root and the client router expands `?/route` into the path.
+function make_url( route ) {
+	const base = `http://localhost:${ PORT }${ MOUNT }`
+	if ( ROUTE_FORMAT === 'path' ) {
+		if ( !route ) return base
+		return `${ base }?/${ route.replace( /&/g, '~and~' ) }`
 	}
-	return `http://localhost:${ PORT }/#!${ ROUTE_KEY }=${ screen_id }`
+	if ( !route ) return base
+	if ( ROUTE_FORMAT === '?' ) return `${ base }?${ ROUTE_KEY }=${ route }`
+	return `${ base }#!${ ROUTE_KEY }=${ route }`
 }
 
-function make_sitemap_url( screen_id ) {
-	if ( !screen_id ) return BASE_URL
-	// Sitemap points to actual static HTML files, not hash/query URLs
-	return `${ BASE_URL }${ screen_id }.html`
+function make_sitemap_url( route ) {
+	if ( !route ) return BASE_URL
+	if ( ROUTE_FORMAT === 'path' ) return `${ BASE_URL }${ route }`
+	// Legacy: sitemap points to actual static HTML files, not hash/query URLs.
+	return `${ BASE_URL }${ route }.html`
+}
+
+// Where to write the rendered HTML for a route. `path` mode writes `<route>/index.html`
+// so GitHub Pages serves it at `/<route>` with a 200; legacy modes write `<route>.html`.
+function out_path( route ) {
+	if ( !route ) return 'index.html'
+	if ( ROUTE_FORMAT === 'path' ) return join( route, 'index.html' )
+	return `${ route }.html`
+}
+
+// In-page: expand the app's `data-bog-meta` JSON into real <head> tags (title, meta,
+// og:*, twitter:*, canonical, hreflang alternates) so crawlers and social scrapers —
+// which never run JS — get full per-page SEO from the static file. Also guarantees a
+// <base href> so relative assets resolve from the mount on any deep path.
+function inject_meta_in_page( mount ) {
+	const root = document.querySelector( '[data-bog-meta]' )
+	const head = document.head
+
+	// <base href> — the client router adds one at runtime; ensure it's in the dump too.
+	if ( !head.querySelector( 'base[href]' ) ) {
+		const base = document.createElement( 'base' )
+		base.setAttribute( 'href', mount )
+		head.insertBefore( base, head.firstChild )
+	}
+
+	if ( !root ) return
+	let meta
+	try { meta = JSON.parse( root.getAttribute( 'data-bog-meta' ) || '{}' ) } catch { return }
+
+	const upsert = ( selector, tag, attrs ) => {
+		let el = head.querySelector( selector )
+		if ( !el ) { el = document.createElement( tag ); head.appendChild( el ) }
+		for ( const [ k, v ] of Object.entries( attrs ) ) el.setAttribute( k, v )
+	}
+
+	const title = meta.title
+	const desc = meta.description
+	const url = meta.canonical
+
+	if ( title ) document.title = title
+	if ( desc ) upsert( 'meta[name="description"]', 'meta', { name: 'description', content: desc } )
+	if ( url ) upsert( 'link[rel="canonical"]', 'link', { rel: 'canonical', href: url } )
+
+	if ( meta.og_title ) upsert( 'meta[property="og:title"]', 'meta', { property: 'og:title', content: meta.og_title } )
+	if ( meta.og_description ) upsert( 'meta[property="og:description"]', 'meta', { property: 'og:description', content: meta.og_description } )
+	if ( meta.og_type ) upsert( 'meta[property="og:type"]', 'meta', { property: 'og:type', content: meta.og_type } )
+	if ( meta.og_image ) upsert( 'meta[property="og:image"]', 'meta', { property: 'og:image', content: meta.og_image } )
+	if ( url ) upsert( 'meta[property="og:url"]', 'meta', { property: 'og:url', content: url } )
+
+	if ( meta.og_image ) {
+		upsert( 'meta[name="twitter:card"]', 'meta', { name: 'twitter:card', content: 'summary_large_image' } )
+		if ( title ) upsert( 'meta[name="twitter:title"]', 'meta', { name: 'twitter:title', content: title } )
+		if ( desc ) upsert( 'meta[name="twitter:description"]', 'meta', { name: 'twitter:description', content: desc } )
+		upsert( 'meta[name="twitter:image"]', 'meta', { name: 'twitter:image', content: meta.og_image } )
+	}
+
+	// hreflang alternates — remove stale ones, then add the current set.
+	for ( const el of head.querySelectorAll( 'link[rel="alternate"][hreflang]' ) ) el.remove()
+	for ( const alt of ( meta.alternates || [] ) ) {
+		const link = document.createElement( 'link' )
+		link.setAttribute( 'rel', 'alternate' )
+		link.setAttribute( 'hreflang', alt.lang )
+		link.setAttribute( 'href', alt.href )
+		head.appendChild( link )
+	}
 }
 
 async function prerender() {
@@ -104,7 +204,9 @@ async function prerender() {
 
 	const [ vw, vh ] = VIEWPORT.split( 'x' ).map( Number )
 
-	const all_screens = [ '', ...SCREENS ] // '' = index/home
+	// '' = index/home; merge explicit screens with routes discovered in the sitemap.
+	const sitemap_routes = await routes_from_sitemap()
+	const all_routes = [ '', ...new Set( [ ...SCREENS, ...sitemap_routes ] ) ]
 
 	const server = await serve()
 	const browser = await puppeteer.launch({
@@ -112,75 +214,81 @@ async function prerender() {
 		args: [ '--no-sandbox', '--disable-setuid-sandbox' ],
 	})
 
+	let ok = 0, failed = 0
 	try {
 		const page = await browser.newPage()
 		await page.setViewport({ width: vw, height: vh })
 
 		const sitemap_entries = []
 
-		for ( const screen_id of all_screens ) {
-			const url = make_url( screen_id )
-			const label = screen_id || 'index'
+		for ( const route of all_routes ) {
+			const url = make_url( route )
+			const label = route || 'index'
 
-			console.log( `Rendering: ${ label }...` )
-			await page.goto( url, { waitUntil: 'networkidle0', timeout: 30_000 } )
+			try {
+				console.log( `Rendering: ${ label } ...` )
+				await page.goto( url, { waitUntil: 'networkidle0', timeout: 30_000 } )
 
-			// Wait for $mol to render content into root element
-			await page.waitForFunction(
-				( selector, expected ) => {
-					const root = document.querySelector( selector )
-					if ( !root || root.children.length === 0 ) return false
-					if ( !expected ) return true
-					return !!root.querySelector( `[class*="${ expected }"]` )
-						|| !!root.querySelector( `[mol_view_root*="${ expected }"]` )
-						|| root.innerHTML.length > 500
-				},
-				{ timeout: TIMEOUT },
-				root_selector,
-				screen_id,
-			)
+				// Wait for $mol to render content into the root element.
+				await page.waitForFunction(
+					( selector ) => {
+						const root = document.querySelector( selector )
+						return !!root && ( root.children.length > 0 || root.innerHTML.length > 500 )
+					},
+					{ timeout: TIMEOUT },
+					root_selector,
+				)
 
-			// Extra wait for async content
-			await new Promise( r => setTimeout( r, 2000 ) )
+				// Extra settle for async content (fonts, lazy chunks).
+				await new Promise( r => setTimeout( r, 1500 ) )
 
-			// Extract title and description from the rendered page
-			const meta = await page.evaluate( () => ({
-				title: document.title || '',
-				desc: document.querySelector( 'meta[name="description"]' )?.getAttribute( 'content' ) || '',
-			}) )
+				await page.evaluate( inject_meta_in_page, MOUNT )
 
-			const html = await page.content()
-			const filename = screen_id ? `${ screen_id }.html` : 'index.html'
-			await writeFile( join( BUILD_DIR, filename ), html, 'utf-8' )
-			console.log( `  -> ${ filename } (${ meta.title })` )
+				const meta = await page.evaluate( () => ( {
+					title: document.title || '',
+					desc: document.querySelector( 'meta[name="description"]' )?.getAttribute( 'content' ) || '',
+				} ) )
 
-			sitemap_entries.push({ id: screen_id, title: meta.title, desc: meta.desc })
+				const html = await page.content()
+				const rel = out_path( route )
+				const dest = join( BUILD_DIR, rel )
+				await mkdir( dirname( dest ), { recursive: true } )
+				await writeFile( dest, html, 'utf-8' )
+				console.log( `  -> ${ rel } (${ meta.title })` )
+
+				sitemap_entries.push({ id: route, title: meta.title, desc: meta.desc })
+				ok++
+			} catch ( e ) {
+				failed++
+				console.error( `  !! ${ label } failed: ${ e.message }` )
+			}
 		}
 
-		// Generate sitemap.xml
-		const now = new Date().toISOString().split( 'T' )[ 0 ]
-		const urls = sitemap_entries.map( s => {
-			const loc = make_sitemap_url( s.id )
-			const priority = s.id ? '0.7' : '1.0'
-			return `  <url>\n    <loc>${ loc }</loc>\n    <lastmod>${ now }</lastmod>\n    <priority>${ priority }</priority>\n  </url>`
-		} )
-		const sitemap = `<?xml version="1.0" encoding="UTF-8"?>
+		// Generate sitemap.xml (skipped if the pipeline ships its own — see README).
+		if ( args[ 'sitemap' ] !== 'false' ) {
+			const now = new Date().toISOString().split( 'T' )[ 0 ]
+			const urls = sitemap_entries.map( s => {
+				const loc = make_sitemap_url( s.id )
+				const priority = s.id ? '0.7' : '1.0'
+				return `  <url>\n    <loc>${ loc }</loc>\n    <lastmod>${ now }</lastmod>\n    <priority>${ priority }</priority>\n  </url>`
+			} )
+			const sitemap = `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
 ${ urls.join( '\n' ) }
 </urlset>`
-		await writeFile( join( BUILD_DIR, 'sitemap.xml' ), sitemap, 'utf-8' )
-		console.log( '-> sitemap.xml' )
+			await writeFile( join( BUILD_DIR, 'sitemap.xml' ), sitemap, 'utf-8' )
+			await writeFile( join( BUILD_DIR, 'robots.txt' ), `User-agent: *\nAllow: /\n\nSitemap: ${ BASE_URL }sitemap.xml`, 'utf-8' )
+			console.log( '-> sitemap.xml + robots.txt' )
+		}
 
-		// Generate robots.txt
-		const robots = `User-agent: *\nAllow: /\n\nSitemap: ${ BASE_URL }sitemap.xml`
-		await writeFile( join( BUILD_DIR, 'robots.txt' ), robots, 'utf-8' )
-		console.log( '-> robots.txt' )
-
-		console.log( `\nDone! Prerendered ${ all_screens.length } pages.` )
+		console.log( `\nDone. Prerendered ${ ok } page(s)${ failed ? `, ${ failed } failed` : '' }.` )
 	} finally {
 		await browser.close()
 		server.close()
 	}
+
+	// Non-blocking by design in CI, but a total wipeout should still surface.
+	if ( ok === 0 ) process.exit( 1 )
 }
 
 prerender().catch( e => { console.error( e ); process.exit( 1 ) } )

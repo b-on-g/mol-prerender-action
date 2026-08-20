@@ -219,6 +219,22 @@ async function prerender() {
 		const page = await browser.newPage()
 		await page.setViewport({ width: vw, height: vh })
 
+		// Одна вкладка обслуживает все маршруты, а приложение хранит состояние в
+		// localStorage — $mol_locale, например, держит там выбранный язык. Без сброса
+		// снимок наследует состояние предыдущего: после `mol_locale=ja/...` страница
+		// `section=docs/page=tooling`, у которой языка в URL нет, отрисовывалась
+		// по-японски. Порядок маршрутов такое лечит лишь по счастливой случайности.
+		// evaluateOnNewDocument выполняется на каждой навигации ДО скриптов страницы,
+		// так что каждый маршрут стартует с чистого состояния.
+		await page.evaluateOnNewDocument( () => {
+			try {
+				localStorage.clear()
+				sessionStorage.clear()
+			} catch {
+				// приватный режим или запрет хранилища — сбрасывать нечего
+			}
+		} )
+
 		const sitemap_entries = []
 
 		for ( const route of all_routes ) {

@@ -108,7 +108,29 @@ runs:
         BUILD_DIR="${{ steps.detect.outputs.build-dir }}"
         HASH=$(cat "$BUILD_DIR/web.js" "$BUILD_DIR/web.css" 2>/dev/null | sha256sum | cut -d' ' -f1)
         SCREENS_HASH=$(echo "${{ inputs.screens }}${{ inputs.base-url }}${{ inputs.route-format }}${{ inputs.route-key }}${{ inputs.viewport }}$(cat '${{ inputs.sitemap-file }}' 2>/dev/null)" | sha256sum | cut -d' ' -f1)
-        echo "key=prerender-${HASH}-${SCREENS_HASH}" >> "$GITHUB_OUTPUT"
+        BASE="prerender-${HASH}-${SCREENS_HASH}"
+
+        if [ -z "${{ inputs.route-content }}" ]; then
+          # Прежнее поведение: ключ строго по бандлу, попадание означает
+          # «пререндер не нужен вовсе».
+          echo "key=$BASE" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # Поштучному режиму мало прочитать кэш — он ДОписывает манифест каждый
+        # прогон. А запись в уже существующий ключ actions/cache пропускает
+        # молча, без ошибки: манифест первого прогона застывает навсегда и
+        # маршруты, которые он записал как «зависимость неизвестна»,
+        # перерисовываются вечно. Поэтому ключ уникален на прогон, а прошлые
+        # снимки достаются откатом по префиксу: сначала прогон с тем же
+        # бандлом, потом любой предыдущий.
+        echo "key=$BASE-${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+        {
+          echo "restore<<KEYS"
+          echo "$BASE-"
+          echo "prerender-"
+          echo "KEYS"
+        } >> "$GITHUB_OUTPUT"
 
     - name: Restore prerender cache
       id: prerender-cache
@@ -124,7 +146,7 @@ runs:
         # Частичный откат нужен только поштучному режиму: он получает прошлые
         # снимки и сам решает по каждому маршруту. Без манифеста ключ остаётся
         # строгим — поведение прежних потребителей не меняется ни на байт.
-        restore-keys: ${{ inputs.route-content != '' && 'prerender-' || '' }}
+        restore-keys: ${{ steps.cache-key.outputs.restore }}
 
     - name: Install Puppeteer
       if: steps.prerender-cache.outputs.cache-hit != 'true' || inputs.route-content != ''

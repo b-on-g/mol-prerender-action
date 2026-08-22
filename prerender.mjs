@@ -25,6 +25,11 @@ const ROUTE_KEY = args[ 'route-key' ] || 'screen'
 const VIEWPORT = args[ 'viewport' ] || '430x932'
 const TIMEOUT = parseInt( args[ 'timeout' ] || '15000' )
 
+/** Сколько DOM должен простоять неизменным, чтобы считать страницу готовой. */
+const SETTLE_QUIET = parseInt( args[ 'settle-quiet' ] || '300' )
+/** Потолок ожидания — прежняя глухая пауза, теперь только как верхняя граница. */
+const SETTLE_CAP = parseInt( args[ 'settle-cap' ] || '1500' )
+
 // Mount = the path the app is served under (from base-url), e.g. `/smalljs/`.
 // For `path` routing the app's client router only activates under this prefix,
 // and static assets (web.js) resolve relative to it.
@@ -327,8 +332,38 @@ async function prerender() {
 					root_selector,
 				)
 
-				// Extra settle for async content (fonts, lazy chunks).
-				await new Promise( r => setTimeout( r, 1500 ) )
+				// Досаживаем асинхронный контент. Раньше здесь стояла глухая пауза
+				// в 1.5 с на КАЖДУЮ страницу: на 896 маршрутах это 22 минуты чистого
+				// сна, больше половины прогона, причём подавляющее большинство
+				// страниц готовы сразу после waitForFunction выше.
+				//
+				// Теперь ждём тишины в DOM: как только полотно перестало меняться
+				// на SETTLE_QUIET, снимаем. Потолок остался прежним — 1.5 с, так что
+				// худший случай не стал хуже прежнего, а типичный короче на порядок.
+				await page.evaluate( ( quiet, cap ) => new Promise( done => {
+
+					let timer = setTimeout( finish, quiet )
+					const ceiling = setTimeout( finish, cap )
+
+					const watcher = new MutationObserver( () => {
+						clearTimeout( timer )
+						timer = setTimeout( finish, quiet )
+					} )
+					watcher.observe( document.documentElement, {
+						subtree: true,
+						childList: true,
+						characterData: true,
+						attributes: true,
+					} )
+
+					function finish() {
+						clearTimeout( timer )
+						clearTimeout( ceiling )
+						watcher.disconnect()
+						done()
+					}
+
+				} ), SETTLE_QUIET, SETTLE_CAP )
 
 				await page.evaluate( inject_meta_in_page, MOUNT )
 

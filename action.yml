@@ -42,6 +42,20 @@ inputs:
     description: "Render wait timeout in milliseconds"
     required: false
     default: "15000"
+  route-manifest:
+    description: >
+      Optional path to a JSON file that lets the action re-render only the routes
+      whose content actually changed, instead of all of them.
+
+      Shape: { "content": [ "<path>", … ], "routes": { "<route>": "<hash>", … } }.
+      `content` lists the build inputs that carry page content — everything else in
+      web.deps.json is treated as the shell. A route is reused from cache only when
+      both the shell hash and that route's own hash are unchanged.
+
+      Purely opt-in: without this input the action behaves exactly as before —
+      one all-or-nothing cache entry keyed on the bundle.
+    required: false
+    default: ""
   folder:
     description: "Path to the build output directory containing index.html (e.g. bog/blitz/blog/-). If omitted, auto-detects by searching for */app/-/index.html."
     required: false
@@ -94,15 +108,20 @@ runs:
           ${{ steps.detect.outputs.build-dir }}/**/index.html
           ${{ steps.detect.outputs.build-dir }}/sitemap.xml
           ${{ steps.detect.outputs.build-dir }}/robots.txt
+          ${{ steps.detect.outputs.build-dir }}/prerender-state.json
         key: ${{ steps.cache-key.outputs.key }}
+        # Частичный откат нужен только поштучному режиму: он получает прошлые
+        # снимки и сам решает по каждому маршруту. Без манифеста ключ остаётся
+        # строгим — поведение прежних потребителей не меняется ни на байт.
+        restore-keys: ${{ inputs.route-manifest != '' && 'prerender-' || '' }}
 
     - name: Install Puppeteer
-      if: steps.prerender-cache.outputs.cache-hit != 'true'
+      if: steps.prerender-cache.outputs.cache-hit != 'true' || inputs.route-manifest != ''
       shell: bash
       run: npm install --prefix "${{ github.action_path }}" puppeteer
 
     - name: Prerender pages
-      if: steps.prerender-cache.outputs.cache-hit != 'true'
+      if: steps.prerender-cache.outputs.cache-hit != 'true' || inputs.route-manifest != ''
       shell: bash
       run: |
         node "${{ github.action_path }}/prerender.mjs" \
@@ -114,4 +133,5 @@ runs:
           --route-key="${{ inputs.route-key }}" \
           --sitemap-file="${{ inputs.sitemap-file }}" \
           --viewport="${{ inputs.viewport }}" \
-          --timeout="${{ inputs.timeout }}"
+          --timeout="${{ inputs.timeout }}" \
+          --route-manifest="${{ inputs.route-manifest }}"

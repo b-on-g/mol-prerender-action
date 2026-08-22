@@ -3,6 +3,7 @@
 import puppeteer from 'puppeteer'
 import { createServer } from 'http'
 import { readFile, writeFile, mkdir } from 'fs/promises'
+import { createHash } from 'crypto'
 import { join, extname, dirname } from 'path'
 import { existsSync } from 'fs'
 
@@ -42,6 +43,44 @@ const SCREENS = ( args[ 'screens' ] || '' )
 // `path` mode can also take the full route list straight from a committed sitemap.xml
 // (single source of truth): every <loc> under base-url becomes a route to prerender.
 const SITEMAP_FILE = args[ 'sitemap-file' ] || ''
+
+// --- поштучный кэш (опционально) --------------------------------------------
+//
+// Без манифеста ничего из этого не работает и поведение прежнее: один общий
+// ключ на все страницы, промах — перерисовываем всё.
+//
+// С манифестом маршрут переиспользуется из прошлого прогона, только если
+// совпали ДВА хэша: его собственный (что за контент на странице) и хэш
+// оболочки (весь остальной код, из которого собран бандл). Оболочка считается
+// консервативно — по web.deps.json за вычетом файлов, которые проект назвал
+// контентными. Поэтому любая правка кода, стилей или чужого модуля по-прежнему
+// перерисовывает всё: быстрый путь достаётся только чистым правкам контента.
+const MANIFEST_FILE = args[ 'route-manifest' ] || ''
+const STATE_FILE = 'prerender-state.json'
+
+async function read_json( file ) {
+	try { return JSON.parse( await readFile( file, 'utf-8' ) ) }
+	catch { return null }
+}
+
+/** Хэш оболочки: всё, от чего зависит бандл, кроме контентных файлов. */
+async function shell_hash( build_dir, content_files ) {
+
+	const deps = await read_json( join( build_dir, 'web.deps.json' ) )
+	if ( !deps?.files ) return null
+
+	const skip = new Set( content_files ?? [] )
+	const hash = createHash( 'sha256' )
+
+	for ( const file of deps.files.slice().sort() ) {
+		if ( skip.has( file ) ) continue
+		hash.update( file )
+		try { hash.update( await readFile( file ) ) }
+		catch { /* файла нет — учитываем сам факт по имени выше */ }
+	}
+
+	return hash.digest( 'hex' )
+}
 
 async function routes_from_sitemap() {
 	if ( !SITEMAP_FILE || !existsSync( SITEMAP_FILE ) ) return []
@@ -237,9 +276,42 @@ async function prerender() {
 
 		const sitemap_entries = []
 
+		const manifest = MANIFEST_FILE ? await read_json( MANIFEST_FILE ) : null
+		if ( MANIFEST_FILE && !manifest ) {
+			console.error( `!! route-manifest не прочитан: ${ MANIFEST_FILE } — рендерим всё` )
+		}
+
+		const shell = manifest ? await shell_hash( BUILD_DIR, manifest.content ) : null
+		const prev = manifest ? await read_json( join( BUILD_DIR, STATE_FILE ) ) : null
+		const same_shell = !!shell && prev?.shell === shell
+		const next_state = { shell, routes: {} }
+
+		if ( manifest ) {
+			console.log( same_shell
+				? 'Оболочка не менялась — перерисуем только маршруты с новым контентом.'
+				: 'Оболочка изменилась — перерисуем все маршруты.' )
+		}
+
+		let reused = 0
+
 		for ( const route of all_routes ) {
 			const url = make_url( route )
 			const label = route || 'index'
+
+			const route_hash = manifest?.routes?.[ route ] ?? null
+			if ( manifest ) next_state.routes[ route ] = route_hash
+
+			// Переиспользуем прошлый снимок, только если сошлось всё сразу:
+			// оболочка, контент маршрута и наличие самого файла на диске.
+			if ( same_shell && route_hash !== null && prev?.routes?.[ route ] === route_hash ) {
+				const dest = join( BUILD_DIR, out_path( route ) )
+				if ( existsSync( dest ) ) {
+					sitemap_entries.push({ id: route, title: '', desc: '' })
+					reused++
+					ok++
+					continue
+				}
+			}
 
 			try {
 				console.log( `Rendering: ${ label } ...` )
@@ -295,6 +367,13 @@ ${ urls.join( '\n' ) }
 			await writeFile( join( BUILD_DIR, 'sitemap.xml' ), sitemap, 'utf-8' )
 			await writeFile( join( BUILD_DIR, 'robots.txt' ), `User-agent: *\nAllow: /\n\nSitemap: ${ BASE_URL }sitemap.xml`, 'utf-8' )
 			console.log( '-> sitemap.xml + robots.txt' )
+		}
+
+		// Состояние кладём рядом со снимками: оно уезжает в кэш вместе с ними
+		// и на следующем прогоне отвечает, что можно не перерисовывать.
+		if ( manifest ) {
+			await writeFile( join( BUILD_DIR, STATE_FILE ), JSON.stringify( next_state ), 'utf-8' )
+			console.log( `Переиспользовано из кэша: ${ reused }, перерисовано: ${ ok - reused }` )
 		}
 
 		console.log( `\nDone. Prerendered ${ ok } page(s)${ failed ? `, ${ failed } failed` : '' }.` )

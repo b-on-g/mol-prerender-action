@@ -42,18 +42,29 @@ inputs:
     description: "Render wait timeout in milliseconds"
     required: false
     default: "15000"
-  route-manifest:
+  route-content:
     description: >
-      Optional path to a JSON file that lets the action re-render only the routes
-      whose content actually changed, instead of all of them.
+      Optional. One path template per line, telling the action which source file
+      a route's content comes from — that is all it needs to re-render only the
+      pages that actually changed, instead of every route.
 
-      Shape: { "content": [ "<path>", … ], "routes": { "<route>": "<hash>", … } }.
-      `content` lists the build inputs that carry page content — everything else in
-      web.deps.json is treated as the shell. A route is reused from cache only when
-      both the shell hash and that route's own hash are unchanged.
+      A route is a set of `key=value` segments, so `{key}` is taken from the route
+      itself and `{key=default}` falls back when the route has no such key:
 
-      Purely opt-in: without this input the action behaves exactly as before —
-      one all-or-nothing cache entry keyed on the bundle.
+        content/{mol_locale=en}/docs/{page}.md
+        content/en/docs/{page}.md
+
+      List every file the page may render from. The second line above matters:
+      a locale that has no translation yet renders the English text, so its
+      snapshot depends on the English file too.
+
+      Everything under a template's literal prefix is treated as content — both the
+      sources and whatever is generated from them — and is excluded from the shell
+      hash. Everything else the bundle depends on is the shell: change any of it and
+      all routes are re-rendered. A route whose template does not resolve is never
+      skipped.
+
+      Purely opt-in: without this input the action behaves exactly as before.
     required: false
     default: ""
   folder:
@@ -113,15 +124,15 @@ runs:
         # Частичный откат нужен только поштучному режиму: он получает прошлые
         # снимки и сам решает по каждому маршруту. Без манифеста ключ остаётся
         # строгим — поведение прежних потребителей не меняется ни на байт.
-        restore-keys: ${{ inputs.route-manifest != '' && 'prerender-' || '' }}
+        restore-keys: ${{ inputs.route-content != '' && 'prerender-' || '' }}
 
     - name: Install Puppeteer
-      if: steps.prerender-cache.outputs.cache-hit != 'true' || inputs.route-manifest != ''
+      if: steps.prerender-cache.outputs.cache-hit != 'true' || inputs.route-content != ''
       shell: bash
       run: npm install --prefix "${{ github.action_path }}" puppeteer
 
     - name: Prerender pages
-      if: steps.prerender-cache.outputs.cache-hit != 'true' || inputs.route-manifest != ''
+      if: steps.prerender-cache.outputs.cache-hit != 'true' || inputs.route-content != ''
       shell: bash
       run: |
         node "${{ github.action_path }}/prerender.mjs" \
@@ -134,4 +145,4 @@ runs:
           --sitemap-file="${{ inputs.sitemap-file }}" \
           --viewport="${{ inputs.viewport }}" \
           --timeout="${{ inputs.timeout }}" \
-          --route-manifest="${{ inputs.route-manifest }}"
+          --route-content="${{ inputs.route-content }}"

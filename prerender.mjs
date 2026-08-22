@@ -60,25 +60,89 @@ const SITEMAP_FILE = args[ 'sitemap-file' ] || ''
 // консервативно — по web.deps.json за вычетом файлов, которые проект назвал
 // контентными. Поэтому любая правка кода, стилей или чужого модуля по-прежнему
 // перерисовывает всё: быстрый путь достаётся только чистым правкам контента.
-const MANIFEST_FILE = args[ 'route-manifest' ] || ''
+// Шаблоны путей к контенту маршрута. Каждый — строка вида
+// `content/{mol_locale=en}/docs/{page}.md`: `{ключ}` берётся из самого маршрута
+// (он и есть набор пар `ключ=значение`), `=значение` — что подставить, если
+// такого ключа в маршруте нет.
+//
+// Шаблонов может быть несколько: у языковой страницы, для которой перевода ещё
+// нет, отрисуется английский текст — значит её снимок зависит и от английского
+// файла тоже. Не учесть это означало бы, что правка английской страницы не
+// обновит четырнадцать языковых копий, которые её показывают.
+const ROUTE_CONTENT = ( args[ 'route-content' ] || '' )
+	.split( '\n' ).map( line => line.trim() ).filter( Boolean )
+
 const STATE_FILE = 'prerender-state.json'
+
+/** Литеральное начало шаблона — до первой подстановки. */
+const content_roots = ROUTE_CONTENT.map( t => t.split( '{' )[ 0 ] ).filter( Boolean )
+
+/** Маршрут — это пары `ключ=значение`, разделённые слэшем. */
+function route_pairs( route ) {
+	const pairs = {}
+	for ( const chunk of route.split( '/' ) ) {
+		const eq = chunk.indexOf( '=' )
+		if ( eq > 0 ) pairs[ chunk.slice( 0, eq ) ] = chunk.slice( eq + 1 )
+	}
+	return pairs
+}
+
+/**
+ * Файлы, от которых зависит контент маршрута. Пустой массив означает
+ * «зависимость неизвестна» — такой маршрут не пропускаем никогда.
+ */
+function route_files( route ) {
+
+	if ( !ROUTE_CONTENT.length ) return []
+	const pairs = route_pairs( route )
+	const files = []
+
+	for ( const template of ROUTE_CONTENT ) {
+		let unresolved = false
+		const file = template.replace( /\{([^}]+)\}/g, ( _, token ) => {
+			const [ key, fallback ] = token.split( '=' )
+			const value = pairs[ key ] ?? fallback
+			if ( value === undefined ) unresolved = true
+			return value ?? ''
+		} )
+		if ( unresolved ) return []   // шаблон не разобрался — считаем зависимость неизвестной
+		if ( existsSync( file ) ) files.push( file )
+	}
+
+	return files
+}
+
+async function route_hash( route ) {
+	const files = route_files( route )
+	if ( !files.length ) return null
+	const hash = createHash( 'sha256' )
+	for ( const file of files ) {
+		hash.update( file )
+		hash.update( await readFile( file ) )
+	}
+	return hash.digest( 'hex' )
+}
 
 async function read_json( file ) {
 	try { return JSON.parse( await readFile( file, 'utf-8' ) ) }
 	catch { return null }
 }
 
+
 /** Хэш оболочки: всё, от чего зависит бандл, кроме контентных файлов. */
-async function shell_hash( build_dir, content_files ) {
+async function shell_hash( build_dir ) {
 
 	const deps = await read_json( join( build_dir, 'web.deps.json' ) )
 	if ( !deps?.files ) return null
 
-	const skip = new Set( content_files ?? [] )
 	const hash = createHash( 'sha256' )
 
 	for ( const file of deps.files.slice().sort() ) {
-		if ( skip.has( file ) ) continue
+		// Всё, что лежит под корнем шаблона контента, — это контент и то, что из
+		// него сгенерировано (у smalljs content.ts, llms.txt, sitemap.xml лежат
+		// там же). Их учитывает хэш маршрута, а не оболочки, иначе правка любой
+		// страницы меняла бы оболочку и пропускать было бы нечего.
+		if ( content_roots.some( root => file.startsWith( root ) ) ) continue
 		hash.update( file )
 		try { hash.update( await readFile( file ) ) }
 		catch { /* файла нет — учитываем сам факт по имени выше */ }
@@ -281,17 +345,13 @@ async function prerender() {
 
 		const sitemap_entries = []
 
-		const manifest = MANIFEST_FILE ? await read_json( MANIFEST_FILE ) : null
-		if ( MANIFEST_FILE && !manifest ) {
-			console.error( `!! route-manifest не прочитан: ${ MANIFEST_FILE } — рендерим всё` )
-		}
-
-		const shell = manifest ? await shell_hash( BUILD_DIR, manifest.content ) : null
-		const prev = manifest ? await read_json( join( BUILD_DIR, STATE_FILE ) ) : null
+		const incremental = ROUTE_CONTENT.length > 0
+		const shell = incremental ? await shell_hash( BUILD_DIR ) : null
+		const prev = incremental ? await read_json( join( BUILD_DIR, STATE_FILE ) ) : null
 		const same_shell = !!shell && prev?.shell === shell
 		const next_state = { shell, routes: {} }
 
-		if ( manifest ) {
+		if ( incremental ) {
 			console.log( same_shell
 				? 'Оболочка не менялась — перерисуем только маршруты с новым контентом.'
 				: 'Оболочка изменилась — перерисуем все маршруты.' )
@@ -303,12 +363,12 @@ async function prerender() {
 			const url = make_url( route )
 			const label = route || 'index'
 
-			const route_hash = manifest?.routes?.[ route ] ?? null
-			if ( manifest ) next_state.routes[ route ] = route_hash
+			const hash = incremental ? await route_hash( route ) : null
+			if ( incremental ) next_state.routes[ route ] = hash
 
 			// Переиспользуем прошлый снимок, только если сошлось всё сразу:
 			// оболочка, контент маршрута и наличие самого файла на диске.
-			if ( same_shell && route_hash !== null && prev?.routes?.[ route ] === route_hash ) {
+			if ( same_shell && hash !== null && prev?.routes?.[ route ] === hash ) {
 				const dest = join( BUILD_DIR, out_path( route ) )
 				if ( existsSync( dest ) ) {
 					sitemap_entries.push({ id: route, title: '', desc: '' })
@@ -406,7 +466,7 @@ ${ urls.join( '\n' ) }
 
 		// Состояние кладём рядом со снимками: оно уезжает в кэш вместе с ними
 		// и на следующем прогоне отвечает, что можно не перерисовывать.
-		if ( manifest ) {
+		if ( incremental ) {
 			await writeFile( join( BUILD_DIR, STATE_FILE ), JSON.stringify( next_state ), 'utf-8' )
 			console.log( `Переиспользовано из кэша: ${ reused }, перерисовано: ${ ok - reused }` )
 		}

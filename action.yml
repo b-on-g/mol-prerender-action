@@ -42,6 +42,13 @@ inputs:
     description: "Render wait timeout in milliseconds"
     required: false
     default: "15000"
+  concurrency:
+    description: >
+      How many browser tabs render routes at once. Rendering is mostly waiting —
+      navigation, networkidle0, the settle pause — so tabs scale the run down
+      almost linearly. Set to 1 for the old sequential behaviour.
+    required: false
+    default: "4"
   route-content:
     description: >
       Optional. One path template per line, telling the action which source file
@@ -167,4 +174,5 @@ runs:
           --sitemap-file="${{ inputs.sitemap-file }}" \
           --viewport="${{ inputs.viewport }}" \
           --timeout="${{ inputs.timeout }}" \
+          --concurrency="${{ inputs.concurrency }}" \
           --route-content="${{ inputs.route-content }}"

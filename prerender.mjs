@@ -30,6 +30,9 @@ const SETTLE_QUIET = parseInt( args[ 'settle-quiet' ] || '300' )
 /** Потолок ожидания — прежняя глухая пауза, теперь только как верхняя граница. */
 const SETTLE_CAP = parseInt( args[ 'settle-cap' ] || '1500' )
 
+/** Сколько вкладок разбирают очередь маршрутов одновременно. */
+const CONCURRENCY = Math.max( 1, parseInt( args[ 'concurrency' ] || '4' ) )
+
 // Mount = the path the app is served under (from base-url), e.g. `/smalljs/`.
 // For `path` routing the app's client router only activates under this prefix,
 // and static assets (web.js) resolve relative to it.
@@ -209,20 +212,38 @@ function serve() {
 			if ( path === '/' || path === '' ) path = '/index.html'
 			const file = join( BUILD_DIR, path )
 
+			// Приложение на лету переписывает адрес на глубокий путь маршрута, и всё,
+			// что оно грузит относительной ссылкой ПОСЛЕ этого — словарь локали,
+			// иконки, — уезжает в `/<маршрут>/web.locale=en.json`. Такого файла нет,
+			// откат отдавал index.html, и `JSON.parse` спотыкался на `<`. Приложение
+			// оставалось без словаря и не дорисовывалось. Ловилось это только под
+			// нагрузкой: по очереди запрос успевал уйти до подмены адреса.
+			//
+			// Сегмент маршрута всегда имеет вид `ключ=значение`, так что ведущие
+			// такие сегменты просто отбрасываем и ищем файл ещё раз.
+			const candidates = [ file ]
+			const parts = path.replace( /^\//, '' ).split( '/' )
+			while ( parts.length > 1 && parts[ 0 ].includes( '=' ) ) {
+				parts.shift()
+				candidates.push( join( BUILD_DIR, parts.join( '/' ) ) )
+			}
+
+			for ( const candidate of candidates ) {
+				try {
+					const data = await readFile( candidate )
+					res.writeHead( 200, { 'Content-Type': MIME[ extname( path ) ] || 'application/octet-stream' } )
+					res.end( data )
+					return
+				} catch { /* пробуем следующий */ }
+			}
+
 			try {
-				const data = await readFile( file )
-				const ext = extname( path )
-				res.writeHead( 200, { 'Content-Type': MIME[ ext ] || 'application/octet-stream' } )
+				const data = await readFile( join( BUILD_DIR, 'index.html' ) )
+				res.writeHead( 200, { 'Content-Type': 'text/html' } )
 				res.end( data )
 			} catch {
-				try {
-					const data = await readFile( join( BUILD_DIR, 'index.html' ) )
-					res.writeHead( 200, { 'Content-Type': 'text/html' } )
-					res.end( data )
-				} catch {
-					res.writeHead( 404 )
-					res.end( 'Not found' )
-				}
+				res.writeHead( 404 )
+				res.end( 'Not found' )
 			}
 		} )
 		server.listen( PORT, () => {
@@ -344,12 +365,21 @@ async function prerender() {
 		args: [ '--no-sandbox', '--disable-setuid-sandbox' ],
 	})
 
-	let ok = 0, failed = 0
-	try {
-		const page = await browser.newPage()
+	/** Вкладка, готовая снимать: свой вьюпорт и чистое хранилище на каждой навигации. */
+	async function new_page() {
+
+		// Каждой вкладке — свой контекст, то есть отдельное хранилище. Вкладки в
+		// общем контексте делят один localStorage на всех, и сброс перед навигацией
+		// в одной затирает состояние соседней прямо посреди её загрузки: страница
+		// зависала на пустом корне и отваливалась по таймауту. Ловится только
+		// параллельным прогоном, потому что по очереди затирать некого.
+		const context = typeof browser.createBrowserContext === 'function'
+			? await browser.createBrowserContext()
+			: browser
+		const page = await context.newPage()
 		await page.setViewport({ width: vw, height: vh })
 
-		// Одна вкладка обслуживает все маршруты, а приложение хранит состояние в
+		// Вкладка обслуживает много маршрутов подряд, а приложение хранит состояние в
 		// localStorage — $mol_locale, например, держит там выбранный язык. Без сброса
 		// снимок наследует состояние предыдущего: после `mol_locale=ja/...` страница
 		// `section=docs/page=tooling`, у которой языка в URL нет, отрисовывалась
@@ -365,7 +395,11 @@ async function prerender() {
 			}
 		} )
 
-		const sitemap_entries = []
+		return page
+	}
+
+	let ok = 0, failed = 0
+	try {
 
 		const incremental = ROUTE_CONTENT.length > 0
 		const shell = incremental ? await shell_hash( BUILD_DIR ) : null
@@ -381,9 +415,13 @@ async function prerender() {
 
 		let reused = 0
 
+		// Сначала раскладываем маршруты на две стопки: что берём готовым и что
+		// рисуем. Это чтение файлов, оно дешёвое и последовательное — а рисование
+		// дальше пойдёт в несколько вкладок.
+		const snapshots = new Map()   // маршрут -> { title, desc } для sitemap
+		const queue = []
+
 		for ( const route of all_routes ) {
-			const url = make_url( route )
-			const label = route || 'index'
 
 			const hash = incremental ? await route_hash( route ) : null
 			if ( incremental ) next_state.routes[ route ] = hash
@@ -394,86 +432,120 @@ async function prerender() {
 			if ( same_shell && hash !== null && prev?.routes?.[ route ] === hash ) {
 				const dest = join( BUILD_DIR, out_path( route ) )
 				if ( existsSync( dest ) ) {
-					sitemap_entries.push({ id: route, title: '', desc: '' })
+					snapshots.set( route, { title: '', desc: '' } )
 					reused++
 					ok++
 					continue
 				}
 			}
 
+			queue.push( route )
+		}
+
+		// Рисование — это почти сплошное ожидание: навигация, networkidle0, пауза до
+		// затихания DOM. Процессор при этом простаивает, поэтому несколько вкладок
+		// разбирают очередь параллельно и время падает почти пропорционально их числу.
+		// Вкладки берут следующий маршрут сами, а не делят список заранее: страницы
+		// разной тяжести, и статичное деление упёрлось бы в самую медленную стопку.
+		let cursor = 0
+
+		async function render_worker() {
+
+			const page = await new_page()
+
 			try {
-				console.log( `Rendering: ${ label } ...` )
-				await page.goto( url, { waitUntil: 'networkidle0', timeout: 30_000 } )
+				while ( cursor < queue.length ) {
 
-				// Wait for $mol to render content into the root element.
-				await page.waitForFunction(
-					( selector ) => {
-						const root = document.querySelector( selector )
-						return !!root && ( root.children.length > 0 || root.innerHTML.length > 500 )
-					},
-					{ timeout: TIMEOUT },
-					root_selector,
-				)
+					const route = queue[ cursor++ ]
+					const url = make_url( route )
+					const label = route || 'index'
 
-				// Досаживаем асинхронный контент. Раньше здесь стояла глухая пауза
-				// в 1.5 с на КАЖДУЮ страницу: на 896 маршрутах это 22 минуты чистого
-				// сна, больше половины прогона, причём подавляющее большинство
-				// страниц готовы сразу после waitForFunction выше.
-				//
-				// Теперь ждём тишины в DOM: как только полотно перестало меняться
-				// на SETTLE_QUIET, снимаем. Потолок остался прежним — 1.5 с, так что
-				// худший случай не стал хуже прежнего, а типичный короче на порядок.
-				await page.evaluate( ( quiet, cap ) => new Promise( done => {
+					try {
 
-					let timer = setTimeout( finish, quiet )
-					const ceiling = setTimeout( finish, cap )
+						await page.goto( url, { waitUntil: 'networkidle0', timeout: 30_000 } )
 
-					const watcher = new MutationObserver( () => {
-						clearTimeout( timer )
-						timer = setTimeout( finish, quiet )
-					} )
-					watcher.observe( document.documentElement, {
-						subtree: true,
-						childList: true,
-						characterData: true,
-						attributes: true,
-					} )
+						// Wait for $mol to render content into the root element.
+						await page.waitForFunction(
+							( selector ) => {
+								const root = document.querySelector( selector )
+								return !!root && ( root.children.length > 0 || root.innerHTML.length > 500 )
+							},
+							{ timeout: TIMEOUT },
+							root_selector,
+						)
 
-					function finish() {
-						clearTimeout( timer )
-						clearTimeout( ceiling )
-						watcher.disconnect()
-						done()
+						// Досаживаем асинхронный контент. Раньше здесь стояла глухая пауза
+						// в 1.5 с на КАЖДУЮ страницу: на 896 маршрутах это 22 минуты чистого
+						// сна, больше половины прогона, причём подавляющее большинство
+						// страниц готовы сразу после waitForFunction выше.
+						//
+						// Теперь ждём тишины в DOM: как только полотно перестало меняться
+						// на SETTLE_QUIET, снимаем. Потолок остался прежним — 1.5 с, так что
+						// худший случай не стал хуже прежнего, а типичный короче на порядок.
+						await page.evaluate( ( quiet, cap ) => new Promise( settled => {
+
+							let timer = setTimeout( finish, quiet )
+							const ceiling = setTimeout( finish, cap )
+
+							const watcher = new MutationObserver( () => {
+								clearTimeout( timer )
+								timer = setTimeout( finish, quiet )
+							} )
+							watcher.observe( document.documentElement, {
+								subtree: true,
+								childList: true,
+								characterData: true,
+								attributes: true,
+							} )
+
+							function finish() {
+								clearTimeout( timer )
+								clearTimeout( ceiling )
+								watcher.disconnect()
+								settled()
+							}
+
+						} ), SETTLE_QUIET, SETTLE_CAP )
+
+						await page.evaluate( inject_meta_in_page, MOUNT )
+
+						const meta = await page.evaluate( () => ( {
+							title: document.title || '',
+							desc: document.querySelector( 'meta[name="description"]' )?.getAttribute( 'content' ) || '',
+						} ) )
+
+						const html = await page.content()
+						const rel = out_path( route )
+						const dest = join( BUILD_DIR, rel )
+						await mkdir( dirname( dest ), { recursive: true } )
+						await writeFile( dest, html, 'utf-8' )
+						console.log( `  -> ${ rel } (${ meta.title })` )
+
+						snapshots.set( route, { title: meta.title, desc: meta.desc } )
+						ok++
+
+					} catch ( e ) {
+						failed++
+						console.error( `  !! ${ label } failed: ${ e.message }` )
 					}
-
-				} ), SETTLE_QUIET, SETTLE_CAP )
-
-				await page.evaluate( inject_meta_in_page, MOUNT )
-
-				const meta = await page.evaluate( () => ( {
-					title: document.title || '',
-					desc: document.querySelector( 'meta[name="description"]' )?.getAttribute( 'content' ) || '',
-				} ) )
-
-				const html = await page.content()
-				const rel = out_path( route )
-				const dest = join( BUILD_DIR, rel )
-				await mkdir( dirname( dest ), { recursive: true } )
-				await writeFile( dest, html, 'utf-8' )
-				console.log( `  -> ${ rel } (${ meta.title })` )
-
-				sitemap_entries.push({ id: route, title: meta.title, desc: meta.desc })
-				ok++
-			} catch ( e ) {
-				failed++
-				console.error( `  !! ${ label } failed: ${ e.message }` )
+				}
+			} finally {
+				const context = page.browserContext?.()
+				await page.close()
+				if ( context && context !== browser.defaultBrowserContext?.() ) await context.close()
 			}
 		}
+
+		const hands = Math.max( 1, Math.min( CONCURRENCY, queue.length ) )
+		if ( queue.length ) console.log( `Рисуем ${ queue.length } страниц в ${ hands } вкладк(и/ах).` )
+		await Promise.all( Array.from( { length: hands }, render_worker ) )
 
 		// Generate sitemap.xml (skipped if the pipeline ships its own — see README).
 		if ( args[ 'sitemap' ] !== 'false' ) {
 			const now = new Date().toISOString().split( 'T' )[ 0 ]
-			const urls = sitemap_entries.map( s => {
+			// Порядок — как в списке маршрутов, а не как вкладки успели их снять.
+			const urls = all_routes.filter( r => snapshots.has( r ) ).map( r => {
+				const s = { id: r, ... snapshots.get( r ) }
 				const loc = make_sitemap_url( s.id )
 				const priority = s.id ? '0.7' : '1.0'
 				return `  <url>\n    <loc>${ loc }</loc>\n    <lastmod>${ now }</lastmod>\n    <priority>${ priority }</priority>\n  </url>`
@@ -491,10 +563,14 @@ ${ urls.join( '\n' ) }
 		// и на следующем прогоне отвечает, что можно не перерисовывать.
 		if ( incremental ) {
 			await writeFile( join( BUILD_DIR, STATE_FILE ), JSON.stringify( next_state ), 'utf-8' )
-			console.log( `Переиспользовано из кэша: ${ reused }, перерисовано: ${ ok - reused }` )
 		}
 
-		console.log( `\nDone. Prerendered ${ ok } page(s)${ failed ? `, ${ failed } failed` : '' }.` )
+		// Итог одной строкой, и без слова «отрисовано» напротив числа всех
+		// страниц: в удачном прогоне отрисовано ноль, а страниц по-прежнему 912.
+		const parts = [ `${ ok } страниц на выходе` ]
+		if ( incremental ) parts.push( `${ reused } из кэша`, `${ ok - reused } отрисовано заново` )
+		if ( failed ) parts.push( `${ failed } не вышло` )
+		console.log( `\nГотово: ${ parts.join( ', ' ) }.` )
 	} finally {
 		await browser.close()
 		server.close()

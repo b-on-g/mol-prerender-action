@@ -154,6 +154,14 @@ async function read_json( file ) {
 }
 
 
+/**
+ * Версия самого рендерера. Входит в хэш оболочки, поэтому правка того, КАК
+ * снимается страница, обесценивает старые снимки. Без этого кэш переживал
+ * обновление экшена: бандл прежний — оболочка «та же» — страницы берутся из
+ * прошлого прогона, и исправление до продакшена не доезжает.
+ */
+const RENDERER = '2-local-origin'
+
 /** Хэш оболочки: всё, от чего зависит бандл, кроме контентных файлов. */
 async function shell_hash( build_dir ) {
 
@@ -161,6 +169,7 @@ async function shell_hash( build_dir ) {
 	if ( !deps?.files ) return null
 
 	const hash = createHash( 'sha256' )
+	hash.update( RENDERER )
 
 	for ( const file of deps.files.slice().sort() ) {
 		// Всё, что лежит под корнем шаблона контента, — это контент и то, что из
@@ -187,6 +196,19 @@ async function routes_from_sitemap() {
 }
 
 const PORT = 9222
+const LOCAL_ORIGIN = `http://localhost:${ PORT }`
+
+/**
+ * Снимок делается с локального сервера, и всё, что приложение отрисовало
+ * абсолютным адресом ( href у ссылок $mol ), уносит в статику его origin.
+ * На быстром канале это незаметно: бандл поднимается и переписывает ссылки
+ * на настоящие. На медленном — и у краулера, который JS не выполняет, — в
+ * HTML остаётся http://localhost:9222/…, то есть весь внутренний перелинк
+ * страницы ведёт в никуда. Меняем origin на боевой, пути не трогаем.
+ */
+function localize( html ) {
+	return html.split( LOCAL_ORIGIN ).join( new URL( BASE_URL ).origin )
+}
 
 const MIME = {
 	'.html': 'text/html',
@@ -514,7 +536,7 @@ async function prerender() {
 							desc: document.querySelector( 'meta[name="description"]' )?.getAttribute( 'content' ) || '',
 						} ) )
 
-						const html = await page.content()
+						const html = localize( await page.content() )
 						const rel = out_path( route )
 						const dest = join( BUILD_DIR, rel )
 						await mkdir( dirname( dest ), { recursive: true } )

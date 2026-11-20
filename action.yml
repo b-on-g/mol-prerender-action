@@ -113,7 +113,7 @@ runs:
       shell: bash
       run: |
         BUILD_DIR="${{ steps.detect.outputs.build-dir }}"
-        HASH=$(cat "$BUILD_DIR/web.js" "$BUILD_DIR/web.css" 2>/dev/null | sha256sum | cut -d' ' -f1)
+        HASH=$(cd "$BUILD_DIR" && find . -type f ! -name '*.map' ! -name 'node.*' ! -name '*.test.js' ! -name 'test.html' ! -name 'prerender-state.json' -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)
         SCREENS_HASH=$(echo "${{ inputs.screens }}${{ inputs.base-url }}${{ inputs.route-format }}${{ inputs.route-key }}${{ inputs.viewport }}$(cat '${{ inputs.sitemap-file }}' 2>/dev/null)" | sha256sum | cut -d' ' -f1)
         BASE="prerender-${HASH}-${SCREENS_HASH}"
 

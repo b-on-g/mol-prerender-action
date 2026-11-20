@@ -100,8 +100,8 @@ route-content: |
 ```
 
 A snapshot is reused only when two hashes match: the route's own content, and
-the **shell** — every file in `web.deps.json` outside the templates' literal
-root. So any change to code, styles or a dependency still re-renders everything;
+the **shell** — `index.html` and every file in `web.deps.json` outside the
+templates' literal root. So any change to code, styles or a dependency still re-renders everything;
 the fast path is for content-only commits.
 
 Two consequences worth knowing before you turn this on:

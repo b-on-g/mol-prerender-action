@@ -170,6 +170,7 @@ async function shell_hash( build_dir ) {
 
 	const hash = createHash( 'sha256' )
 	hash.update( RENDERER )
+	hash.update( await readFile( join( build_dir, 'index.html' ) ) )
 
 	for ( const file of deps.files.slice().sort() ) {
 		// Всё, что лежит под корнем шаблона контента, — это контент и то, что из
